@@ -1,4 +1,4 @@
-from __future__ import annotations
+ from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
@@ -109,6 +109,66 @@ def records(response: Any) -> list[dict[str, Any]]:
 def current_client() -> Client:
     return new_supabase_client()
 
+
+# ---------------------------------------------------------------------
+# Configuración comercial persistente
+# ---------------------------------------------------------------------
+def get_business_settings() -> dict[str, Any]:
+    defaults = {
+        "business_name": "Embutidos Rodríguez",
+        "slogan": "Tradición que se disfruta en cada bocado",
+        "phone": "",
+        "address": "La Piedad, Michoacán",
+        "logo_url": "",
+        "secondary_logo_url": "",
+    }
+    try:
+        rows = records(
+            current_client().table("business_settings").select("*").limit(1).execute()
+        )
+        if rows:
+            defaults.update({k: v for k, v in rows[0].items() if v is not None})
+    except Exception:
+        # La tabla se crea con el archivo de actualización SQL v5.1.
+        pass
+    return defaults
+
+
+def save_business_settings(payload: dict[str, Any]) -> None:
+    sb = current_client()
+    rows = records(sb.table("business_settings").select("owner_id").limit(1).execute())
+    if rows:
+        sb.table("business_settings").update(payload).eq(
+            "owner_id", rows[0]["owner_id"]
+        ).execute()
+    else:
+        sb.table("business_settings").insert(payload).execute()
+
+
+def upload_branding_file(uploaded_file: Any, label: str) -> str:
+    sb = current_client()
+    user_response = sb.auth.get_user()
+    user = getattr(user_response, "user", None)
+    if not user:
+        raise RuntimeError("No fue posible identificar al usuario.")
+    suffix = Path(uploaded_file.name).suffix.lower() or ".png"
+    object_path = f"{user.id}/{label}{suffix}"
+    data = uploaded_file.getvalue()
+    try:
+        sb.storage.from_("branding").remove([object_path])
+    except Exception:
+        pass
+    sb.storage.from_("branding").upload(
+        object_path,
+        data,
+        {"content-type": uploaded_file.type or "image/png", "upsert": "true"},
+    )
+    result = sb.storage.from_("branding").get_public_url(object_path)
+    if isinstance(result, str):
+        return result
+    if isinstance(result, dict):
+        return str(result.get("publicUrl") or result.get("public_url") or "")
+    return str(result)
 
 # ---------------------------------------------------------------------
 # Operaciones de datos
@@ -238,6 +298,10 @@ def build_ticket_html(sale_id: str, paper_width: str, show_prices: bool) -> str:
             f"<div class='line total'><strong>TOTAL</strong><strong>{money(total)}</strong></div>"
         )
 
+    settings = get_business_settings()
+    business_name = escape(str(settings.get("business_name") or "Embutidos Rodríguez"))
+    slogan = escape(str(settings.get("slogan") or ""))
+
     return f"""<!DOCTYPE html>
 <html lang="es"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
@@ -252,8 +316,8 @@ def build_ticket_html(sale_id: str, paper_width: str, show_prices: bool) -> str:
 .small{{font-size:10px}} .no-print{{display:block;width:100%;margin:12px auto;padding:10px;border:0;border-radius:8px;font-weight:700}}
 @media print{{.no-print{{display:none!important}}}}
 </style></head><body><div class="ticket">
-<div class="center"><div class="brand">EMBUTIDOS RODRÍGUEZ</div>
-<div>Tradición que se disfruta en cada bocado</div>
+<div class="center"><div class="brand">{business_name}</div>
+<div>{slogan}</div>
 <div class="small">Ticket de venta / entrega</div></div>
 <div class="rule"></div>
 <div><strong>Folio:</strong> {escape(str(sale['folio']))}</div>
@@ -352,8 +416,11 @@ if not is_logged_in():
 # ---------------------------------------------------------------------
 # Navegación
 # ---------------------------------------------------------------------
+settings = get_business_settings()
 with st.sidebar:
-    st.markdown("## 🐷 Embutidos Rodríguez")
+    if settings.get("logo_url"):
+        st.image(settings["logo_url"], use_container_width=True)
+    st.markdown(f"## 🐷 {settings.get('business_name', 'Embutidos Rodríguez')}")
     st.caption(st.session_state.get("sb_user_email", ""))
     menu = st.radio(
         "Menú",
@@ -366,6 +433,7 @@ with st.sidebar:
             "Productos",
             "Cuentas por cobrar",
             "Reportes",
+            "Configuración",
         ],
         label_visibility="collapsed",
     )
@@ -396,9 +464,15 @@ if menu == "Inicio":
     )
     stock = sum(float(p.get("stock_kg") or 0) for p in products)
 
+    logo_cols = st.columns([1, 1, 4])
+    if settings.get("logo_url"):
+        logo_cols[0].image(settings["logo_url"], use_container_width=True)
+    if settings.get("secondary_logo_url"):
+        logo_cols[1].image(settings["secondary_logo_url"], use_container_width=True)
     st.markdown(
-        "<div class='hero'><h1>Panel comercial</h1>"
-        "<div>Los datos de esta versión se guardan permanentemente en Supabase.</div></div>",
+        f"<div class='hero'><h1>{escape(str(settings.get('business_name', 'Embutidos Rodríguez')))}</h1>"
+        f"<div>{escape(str(settings.get('slogan', '')))}</div>"
+        "<div style='margin-top:6px;font-size:12px'>Los datos se guardan permanentemente en Supabase.</div></div>",
         unsafe_allow_html=True,
     )
     c1, c2, c3, c4, c5 = st.columns(5)
@@ -453,7 +527,7 @@ if menu == "Inicio":
 # ---------------------------------------------------------------------
 elif menu == "Productos":
     st.header("Productos")
-    tab1, tab2, tab3 = st.tabs(["Catálogo", "Nuevo producto", "Editar producto"])
+    tab1, tab2, tab3 = st.tabs(["Catálogo visual", "Nuevo producto", "Editar producto"])
 
     with tab1:
         products = get_products()
@@ -461,32 +535,33 @@ elif menu == "Productos":
         if q:
             ql = q.lower()
             products = [
-                p
-                for p in products
+                p for p in products
                 if ql in str(p.get("name", "")).lower()
                 or ql in str(p.get("presentation", "")).lower()
             ]
+        header_cols = st.columns([1, 1, 4])
+        if settings.get("logo_url"):
+            header_cols[0].image(settings["logo_url"], use_container_width=True)
+        if settings.get("secondary_logo_url"):
+            header_cols[1].image(settings["secondary_logo_url"], use_container_width=True)
+        header_cols[2].markdown(
+            f"## {settings.get('business_name', 'Embutidos Rodríguez')}\n"
+            f"*{settings.get('slogan', '')}*"
+        )
         if not products:
             st.info("No hay productos registrados.")
         else:
-            view = pd.DataFrame(products)
-            st.dataframe(
-                view[
-                    [
-                        "name",
-                        "presentation",
-                        "weight_kg",
-                        "cost_per_kg",
-                        "public_price_per_kg",
-                        "wholesale_price_per_kg",
-                        "restaurant_price_per_kg",
-                        "stock_kg",
-                        "min_stock_kg",
-                    ]
-                ],
-                use_container_width=True,
-                hide_index=True,
-            )
+            cols = st.columns(3)
+            for idx, product in enumerate(products):
+                with cols[idx % 3]:
+                    with st.container(border=True):
+                        st.markdown("### 🐷")
+                        st.markdown(f"### {product['name']}")
+                        st.caption(product['presentation'])
+                        st.write(f"**Precio público:** {money(product.get('public_price_per_kg'))}/kg")
+                        st.write(f"**Mayoreo:** {money(product.get('wholesale_price_per_kg'))}/kg")
+                        st.write(f"**Restaurante:** {money(product.get('restaurant_price_per_kg'))}/kg")
+                        st.write(f"**Existencia:** {float(product.get('stock_kg') or 0):.3f} kg")
 
     with tab2:
         with st.form("new_product", clear_on_submit=True):
@@ -607,7 +682,7 @@ elif menu == "Productos":
 # ---------------------------------------------------------------------
 elif menu == "Clientes":
     st.header("Clientes")
-    tab1, tab2, tab3 = st.tabs(["Directorio", "Nuevo cliente", "Precio especial"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Directorio", "Nuevo cliente", "Editar cliente", "Precio especial"])
 
     with tab1:
         clients = get_clients()
@@ -688,6 +763,59 @@ elif menu == "Clientes":
                         st.error(str(exc))
 
     with tab3:
+        clients = get_clients()
+        if not clients:
+            st.info("Primero registra un cliente.")
+        else:
+            client_map = {c["business_name"]: c for c in clients}
+            selected_label = st.selectbox("Cliente a editar", list(client_map))
+            c = client_map[selected_label]
+            with st.form("edit_client"):
+                business_name = st.text_input("Nombre comercial", value=c.get("business_name") or "")
+                contact_name = st.text_input("Encargado", value=c.get("contact_name") or "")
+                phone = st.text_input("Teléfono", value=c.get("phone") or "")
+                city = st.text_input("Ciudad", value=c.get("city") or "")
+                address = st.text_input("Dirección", value=c.get("address") or "")
+                types = ["Público general", "Tienda", "Restaurante", "Mayorista", "Cadena comercial"]
+                terms = ["Contado", "Crédito"]
+                c1, c2, c3 = st.columns(3)
+                client_type = c1.selectbox(
+                    "Tipo", types,
+                    index=types.index(c.get("client_type")) if c.get("client_type") in types else 0,
+                )
+                payment_terms = c2.selectbox(
+                    "Condición de pago", terms,
+                    index=terms.index(c.get("payment_terms")) if c.get("payment_terms") in terms else 0,
+                )
+                credit_days = c3.number_input(
+                    "Días de crédito", min_value=0, step=1,
+                    value=int(c.get("credit_days") or 0),
+                )
+                notes = st.text_area("Observaciones", value=c.get("notes") or "")
+                active = st.checkbox("Cliente activo", value=bool(c.get("active", True)))
+                if st.form_submit_button("Guardar cambios", type="primary"):
+                    if not business_name.strip():
+                        st.error("El nombre comercial es obligatorio.")
+                    else:
+                        try:
+                            current_client().table("clients").update({
+                                "business_name": business_name.strip(),
+                                "contact_name": contact_name,
+                                "phone": phone,
+                                "city": city,
+                                "address": address,
+                                "client_type": client_type,
+                                "payment_terms": payment_terms,
+                                "credit_days": int(credit_days),
+                                "notes": notes,
+                                "active": active,
+                            }).eq("id", c["id"]).execute()
+                            st.success("Cliente actualizado correctamente.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+    with tab4:
         clients = get_clients()
         products = get_products()
         if not clients or not products:
@@ -1238,4 +1366,49 @@ elif menu == "Reportes":
             file_name=f"ventas_{start}_{end}.csv",
             mime="text/csv",
         )
+
+# ---------------------------------------------------------------------
+# Configuración
+# ---------------------------------------------------------------------
+elif menu == "Configuración":
+    st.header("Configuración e identidad")
+    st.caption("Estos datos y logotipos quedan guardados permanentemente en Supabase.")
+    current = get_business_settings()
+    with st.form("business_settings_form"):
+        business_name = st.text_input("Nombre comercial", value=current.get("business_name") or "")
+        slogan = st.text_input("Eslogan", value=current.get("slogan") or "")
+        phone = st.text_input("Teléfono", value=current.get("phone") or "")
+        address = st.text_input("Dirección o ciudad", value=current.get("address") or "")
+        logo_file = st.file_uploader("Logotipo principal", type=["png", "jpg", "jpeg", "webp"])
+        secondary_file = st.file_uploader("Logotipo de Grupo Comercial Rodríguez", type=["png", "jpg", "jpeg", "webp"])
+        submitted = st.form_submit_button("Guardar configuración", type="primary")
+        if submitted:
+            try:
+                logo_url = current.get("logo_url") or ""
+                secondary_logo_url = current.get("secondary_logo_url") or ""
+                if logo_file:
+                    logo_url = upload_branding_file(logo_file, "logo-principal")
+                if secondary_file:
+                    secondary_logo_url = upload_branding_file(secondary_file, "logo-secundario")
+                save_business_settings({
+                    "business_name": business_name.strip() or "Embutidos Rodríguez",
+                    "slogan": slogan.strip(),
+                    "phone": phone.strip(),
+                    "address": address.strip(),
+                    "logo_url": logo_url,
+                    "secondary_logo_url": secondary_logo_url,
+                })
+                st.success("Configuración guardada permanentemente.")
+                st.rerun()
+            except Exception as exc:
+                st.error(
+                    "No fue posible guardar la configuración. Ejecuta primero el archivo "
+                    f"actualizacion_v5_1.sql en Supabase. Detalle: {exc}"
+                )
+
+    c1, c2 = st.columns(2)
+    if current.get("logo_url"):
+        c1.image(current["logo_url"], caption="Logotipo principal", use_container_width=True)
+    if current.get("secondary_logo_url"):
+        c2.image(current["secondary_logo_url"], caption="Logotipo secundario", use_container_width=True)
 
