@@ -6,6 +6,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Any
 import json
+import time
 
 import pandas as pd
 import streamlit as st
@@ -78,6 +79,7 @@ def hydrate_auth_from_cookie() -> None:
                     }
                 )
                 cookies.save()
+                time.sleep(0.5)
     except Exception:
         try:
             del cookies["supabase_session"]
@@ -139,6 +141,9 @@ def save_auth(response: Any) -> None:
             }
         )
         cookies.save()
+        # El componente guarda la cookie en el navegador de forma asíncrona.
+        # Esta pausa evita que st.rerun() interrumpa el guardado, especialmente en iPhone.
+        time.sleep(1.5)
     elif user:
         st.session_state["sb_user_email"] = user.email
 
@@ -591,6 +596,8 @@ if not is_logged_in():
                         {"email": email.strip(), "password": password}
                     )
                     save_auth(response)
+                    st.success("Sesión iniciada y guardada en este dispositivo.")
+                    time.sleep(0.5)
                     st.rerun()
                 except Exception as exc:
                     st.error(f"No fue posible iniciar sesión: {exc}")
@@ -614,7 +621,8 @@ if not is_logged_in():
                     )
                     if getattr(response, "session", None):
                         save_auth(response)
-                        st.success("Cuenta creada e iniciada.")
+                        st.success("Cuenta creada; la sesión quedó guardada.")
+                        time.sleep(0.5)
                         st.rerun()
                     else:
                         st.success(
@@ -634,6 +642,7 @@ with st.sidebar:
         st.image(settings["logo_url"], use_container_width=True)
     st.markdown(f"## 🐷 {settings.get('business_name', 'Embutidos Rodríguez')}")
     st.caption(st.session_state.get("sb_user_email", ""))
+    st.caption("🔒 Sesión persistente activada")
     menu = st.radio(
         "Menú",
         [
