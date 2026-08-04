@@ -377,7 +377,7 @@ def get_expenses(
     start: date | None = None,
     end: date | None = None,
 ) -> list[dict[str, Any]]:
-    owner_id = current_user_id(required=True)
+    owner_id = current_user_id(required=False)
     if not owner_id:
         return []
 
