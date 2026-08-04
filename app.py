@@ -67,7 +67,6 @@ def persist_auth_tokens(
         }
     )
     cookies.save()
-    time.sleep(1.0)
 
 
 def hydrate_auth_from_cookie() -> None:
@@ -193,6 +192,21 @@ def records(response: Any) -> list[dict[str, Any]]:
 
 def current_client() -> Client:
     return new_supabase_client()
+
+
+def current_user_id() -> str:
+    """Devuelve el UUID del usuario autenticado en Supabase."""
+    try:
+        response = current_client().auth.get_user()
+        user = getattr(response, "user", None)
+        user_id = getattr(user, "id", None)
+        if not user_id:
+            raise RuntimeError("No se pudo identificar al usuario activo.")
+        return str(user_id)
+    except Exception as exc:
+        raise RuntimeError(
+            "La sesión no es válida. Cierra sesión, vuelve a entrar e inténtalo otra vez."
+        ) from exc
 
 
 # ---------------------------------------------------------------------
@@ -332,7 +346,12 @@ def get_expenses(
     start: date | None = None,
     end: date | None = None,
 ) -> list[dict[str, Any]]:
-    query = current_client().table("expenses").select("*")
+    query = (
+        current_client()
+        .table("expenses")
+        .select("*")
+        .eq("owner_id", current_user_id())
+    )
     if start:
         query = query.gte("expense_date", start.isoformat())
     if end:
@@ -620,8 +639,7 @@ if not is_logged_in():
                         {"email": email.strip(), "password": password}
                     )
                     save_auth(response)
-                    st.success("Sesión iniciada y guardada en este dispositivo.")
-                    time.sleep(0.5)
+                    st.success("Sesión iniciada.")
                     st.rerun()
                 except Exception as exc:
                     st.error(f"No fue posible iniciar sesión: {exc}")
@@ -646,7 +664,6 @@ if not is_logged_in():
                     if getattr(response, "session", None):
                         save_auth(response)
                         st.success("Cuenta creada; la sesión quedó guardada.")
-                        time.sleep(0.5)
                         st.rerun()
                     else:
                         st.success(
@@ -1644,8 +1661,10 @@ elif menu == "Gastos":
                     st.error("Escribe el concepto del gasto.")
                 else:
                     try:
-                        current_client().table("expenses").insert(
+                        owner_id = current_user_id()
+                        response = current_client().table("expenses").insert(
                             {
+                                "owner_id": owner_id,
                                 "expense_date": expense_date.isoformat(),
                                 "category": category,
                                 "description": description.strip(),
@@ -1656,10 +1675,22 @@ elif menu == "Gastos":
                                 "notes": notes.strip(),
                             }
                         ).execute()
-                        st.success("Gasto guardado permanentemente.")
+
+                        inserted_rows = records(response)
+                        if not inserted_rows:
+                            raise RuntimeError(
+                                "Supabase no confirmó el registro del gasto."
+                            )
+
+                        st.success(
+                            f"Gasto guardado correctamente: {money(amount)}"
+                        )
                         st.rerun()
                     except Exception as exc:
-                        st.error(f"No fue posible guardar el gasto: {exc}")
+                        st.error(
+                            "No fue posible guardar el gasto. "
+                            f"Detalle técnico: {exc}"
+                        )
 
     with tab_history:
         c1, c2 = st.columns(2)
@@ -1811,6 +1842,8 @@ elif menu == "Gastos":
                                     }
                                 ).eq(
                                     "id", selected_expense["id"]
+                                ).eq(
+                                    "owner_id", current_user_id()
                                 ).execute()
                                 st.success("Gasto actualizado.")
                                 st.rerun()
@@ -1829,6 +1862,8 @@ elif menu == "Gastos":
                     try:
                         current_client().table("expenses").delete().eq(
                             "id", selected_expense["id"]
+                        ).eq(
+                            "owner_id", current_user_id()
                         ).execute()
                         st.success("Gasto eliminado.")
                         st.rerun()
