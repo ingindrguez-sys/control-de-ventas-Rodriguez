@@ -59,6 +59,8 @@ def persist_auth_tokens(
     if email:
         st.session_state["sb_user_email"] = email
 
+    st.session_state["sb_session_restored"] = True
+
     cookies["supabase_session"] = json.dumps(
         {
             "access_token": access_token,
@@ -105,23 +107,33 @@ def new_supabase_client() -> Client:
         raise RuntimeError(
             "Faltan SUPABASE_URL y SUPABASE_PUBLISHABLE_KEY en Secrets."
         )
-    client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+    if "sb_client" not in st.session_state:
+        st.session_state["sb_client"] = create_client(
+            SUPABASE_URL,
+            SUPABASE_KEY,
+        )
+
+    client = st.session_state["sb_client"]
 
     access_token = st.session_state.get("sb_access_token")
     refresh_token = st.session_state.get("sb_refresh_token")
-    if access_token and refresh_token:
+    restored = st.session_state.get("sb_session_restored", False)
+
+    if access_token and refresh_token and not restored:
         try:
             response = client.auth.set_session(access_token, refresh_token)
             session = getattr(response, "session", None)
             if session:
-                # Supabase puede rotar el refresh token al renovar la sesión.
                 persist_auth_tokens(
                     session.access_token,
                     session.refresh_token,
                     st.session_state.get("sb_user_email", ""),
                 )
+                st.session_state["sb_session_restored"] = True
         except Exception:
             clear_auth()
+
     return client
 
 
@@ -130,6 +142,8 @@ def clear_auth() -> None:
         "sb_access_token",
         "sb_refresh_token",
         "sb_user_email",
+        "sb_client",
+        "sb_session_restored",
         "cart",
     ):
         st.session_state.pop(key, None)
@@ -194,19 +208,22 @@ def current_client() -> Client:
     return new_supabase_client()
 
 
-def current_user_id() -> str:
-    """Devuelve el UUID del usuario autenticado en Supabase."""
+def current_user_id(required: bool = False) -> str | None:
+    """Devuelve el UUID del usuario activo sin detener toda la aplicación."""
     try:
         response = current_client().auth.get_user()
         user = getattr(response, "user", None)
         user_id = getattr(user, "id", None)
-        if not user_id:
-            raise RuntimeError("No se pudo identificar al usuario activo.")
-        return str(user_id)
-    except Exception as exc:
+        if user_id:
+            return str(user_id)
+    except Exception:
+        pass
+
+    if required:
         raise RuntimeError(
-            "La sesión no es válida. Cierra sesión, vuelve a entrar e inténtalo otra vez."
-        ) from exc
+            "Tu sesión ya no es válida. Cierra sesión y vuelve a entrar."
+        )
+    return None
 
 
 # ---------------------------------------------------------------------
@@ -346,21 +363,29 @@ def get_expenses(
     start: date | None = None,
     end: date | None = None,
 ) -> list[dict[str, Any]]:
+    owner_id = current_user_id(required=True)
+    if not owner_id:
+        return []
+
     query = (
         current_client()
         .table("expenses")
         .select("*")
-        .eq("owner_id", current_user_id())
+        .eq("owner_id", owner_id)
     )
     if start:
         query = query.gte("expense_date", start.isoformat())
     if end:
         query = query.lte("expense_date", end.isoformat())
-    return records(
-        query.order("expense_date", desc=True)
-        .order("created_at", desc=True)
-        .execute()
-    )
+
+    try:
+        return records(
+            query.order("expense_date", desc=True)
+            .order("created_at", desc=True)
+            .execute()
+        )
+    except Exception:
+        return []
 
 
 def sale_detail(sale_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -684,6 +709,8 @@ with st.sidebar:
     st.markdown(f"## 🐷 {settings.get('business_name', 'Embutidos Rodríguez')}")
     st.caption(st.session_state.get("sb_user_email", ""))
     st.caption("🔒 Sesión persistente activada")
+    if not current_user_id():
+        st.warning("La sesión necesita renovarse. Cierra sesión e inicia de nuevo.")
     menu = st.radio(
         "Menú",
         [
@@ -1661,7 +1688,7 @@ elif menu == "Gastos":
                     st.error("Escribe el concepto del gasto.")
                 else:
                     try:
-                        owner_id = current_user_id()
+                        owner_id = current_user_id(required=True)
                         response = current_client().table("expenses").insert(
                             {
                                 "owner_id": owner_id,
