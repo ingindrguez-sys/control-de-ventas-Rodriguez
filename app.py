@@ -48,6 +48,25 @@ if not cookies.ready():
     st.stop()
 
 
+def persist_auth_tokens(access_token: str, refresh_token: str, email: str = "") -> None:
+    """Guarda en sesión y cookie cifrada los tokens actuales de Supabase."""
+    st.session_state["sb_access_token"] = access_token
+    st.session_state["sb_refresh_token"] = refresh_token
+    if email:
+        st.session_state["sb_user_email"] = email
+
+    cookies["supabase_session"] = json.dumps(
+        {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "email": st.session_state.get("sb_user_email", email),
+        }
+    )
+    cookies.save()
+    # El componente escribe la cookie en el navegador de forma asíncrona.
+    time.sleep(1.0)
+
+
 def hydrate_auth_from_cookie() -> None:
     """Recupera la sesión de Supabase desde una cookie cifrada persistente."""
     if st.session_state.get("sb_access_token"):
@@ -66,20 +85,11 @@ def hydrate_auth_from_cookie() -> None:
             session = getattr(refreshed, "session", None)
             user = getattr(refreshed, "user", None)
             if session:
-                st.session_state["sb_access_token"] = session.access_token
-                st.session_state["sb_refresh_token"] = session.refresh_token
-                st.session_state["sb_user_email"] = (
-                    getattr(user, "email", None) or email
+                persist_auth_tokens(
+                    session.access_token,
+                    session.refresh_token,
+                    getattr(user, "email", None) or email,
                 )
-                cookies["supabase_session"] = json.dumps(
-                    {
-                        "access_token": session.access_token,
-                        "refresh_token": session.refresh_token,
-                        "email": st.session_state["sb_user_email"],
-                    }
-                )
-                cookies.save()
-                time.sleep(0.5)
     except Exception:
         try:
             del cookies["supabase_session"]
@@ -102,8 +112,13 @@ def new_supabase_client() -> Client:
             response = client.auth.set_session(access_token, refresh_token)
             session = getattr(response, "session", None)
             if session:
-                st.session_state["sb_access_token"] = session.access_token
-                st.session_state["sb_refresh_token"] = session.refresh_token
+                # set_session puede renovar el access token y ROTAR el refresh token.
+                # Es indispensable guardar ambos valores nuevos en la cookie.
+                persist_auth_tokens(
+                    session.access_token,
+                    session.refresh_token,
+                    st.session_state.get("sb_user_email", ""),
+                )
         except Exception:
             clear_auth()
     return client
@@ -129,21 +144,12 @@ def save_auth(response: Any) -> None:
     session = getattr(response, "session", None)
     user = getattr(response, "user", None)
     if session:
-        st.session_state["sb_access_token"] = session.access_token
-        st.session_state["sb_refresh_token"] = session.refresh_token
         email = getattr(user, "email", None) or ""
-        st.session_state["sb_user_email"] = email
-        cookies["supabase_session"] = json.dumps(
-            {
-                "access_token": session.access_token,
-                "refresh_token": session.refresh_token,
-                "email": email,
-            }
+        persist_auth_tokens(
+            session.access_token,
+            session.refresh_token,
+            email,
         )
-        cookies.save()
-        # El componente guarda la cookie en el navegador de forma asíncrona.
-        # Esta pausa evita que st.rerun() interrumpa el guardado, especialmente en iPhone.
-        time.sleep(1.5)
     elif user:
         st.session_state["sb_user_email"] = user.email
 
@@ -235,11 +241,18 @@ def upload_branding_file(uploaded_file: Any, label: str) -> str:
         sb.storage.from_("branding").remove([object_path])
     except Exception:
         pass
-    sb.storage.from_("branding").upload(
-        object_path,
-        data,
-        {"content-type": uploaded_file.type or "image/png", "upsert": "true"},
-    )
+    try:
+        sb.storage.from_("branding").upload(
+            object_path,
+            data,
+            {"content-type": uploaded_file.type or "image/png", "upsert": "true"},
+        )
+    except Exception as exc:
+        raise RuntimeError(
+            "No fue posible subir la imagen. Ejecuta en Supabase el archivo "
+            "actualizacion_storage_branding_v5_4.sql y vuelve a intentarlo. "
+            f"Detalle: {exc}"
+        ) from exc
     result = sb.storage.from_("branding").get_public_url(object_path)
     if isinstance(result, str):
         return result
@@ -318,6 +331,19 @@ def sales_summary(start: date | None = None, end: date | None = None) -> list[di
     if end:
         query = query.lte("sale_date", end.isoformat())
     return records(query.order("sale_date", desc=True).execute())
+
+
+def get_expenses(start: date | None = None, end: date | None = None) -> list[dict[str, Any]]:
+    query = current_client().table("expenses").select("*")
+    if start:
+        query = query.gte("expense_date", start.isoformat())
+    if end:
+        query = query.lte("expense_date", end.isoformat())
+    return records(
+        query.order("expense_date", desc=True)
+        .order("created_at", desc=True)
+        .execute()
+    )
 
 
 def sale_detail(sale_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
@@ -653,6 +679,7 @@ with st.sidebar:
             "Clientes",
             "Productos",
             "Cuentas por cobrar",
+            "Gastos",
             "Reportes",
             "Configuración",
         ],
@@ -674,6 +701,7 @@ if menu == "Inicio":
     month_start = today.replace(day=1)
     rows = sales_summary(month_start, today)
     products = get_products()
+    expenses = get_expenses(month_start, today)
 
     sales_total = sum(float(r.get("total") or 0) for r in rows)
     kilos = sum(float(r.get("total_kg") or 0) for r in rows)
@@ -696,12 +724,14 @@ if menu == "Inicio":
         "<div style='margin-top:6px;font-size:12px'>Los datos se guardan permanentemente en Supabase.</div></div>",
         unsafe_allow_html=True,
     )
-    c1, c2, c3, c4, c5 = st.columns(5)
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
     c1.metric("Ventas del mes", money(sales_total))
     c2.metric("Kilos vendidos", f"{kilos:,.2f} kg")
     c3.metric("Utilidad bruta", money(profit))
-    c4.metric("Por cobrar", money(receivable))
-    c5.metric("Inventario", f"{stock:,.2f} kg")
+    c4.metric("Gastos registrados", money(expenses_total))
+    c5.metric("Resultado estimado", money(result_after_expenses))
+    c6.metric("Por cobrar", money(receivable))
+    st.caption(f"Inventario total disponible: {stock:,.2f} kg")
 
     left, right = st.columns(2)
     with left:
@@ -1535,6 +1565,240 @@ elif menu == "Cuentas por cobrar":
                 st.error(str(exc))
 
 # ---------------------------------------------------------------------
+# Gastos
+# ---------------------------------------------------------------------
+elif menu == "Gastos":
+    st.header("Gastos del negocio")
+    st.caption(
+        "Registra gastos relacionados con Embutidos Rodríguez. "
+        "El resultado mostrado es una estimación basada en lo capturado."
+    )
+
+    tab1, tab2, tab3 = st.tabs(["Registrar gasto", "Historial", "Resumen"])
+
+    categories = [
+        "Carne y materia prima",
+        "Condimentos e ingredientes",
+        "Empaque y etiquetas",
+        "Gas y energía",
+        "Transporte y combustible",
+        "Mantenimiento",
+        "Mano de obra",
+        "Publicidad y degustaciones",
+        "Comisiones",
+        "Servicios",
+        "Renta",
+        "Otros",
+    ]
+
+    with tab1:
+        with st.form("expense_form", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            expense_date = c1.date_input("Fecha", date.today())
+            category = c2.selectbox("Categoría", categories)
+            description = st.text_input(
+                "Concepto",
+                placeholder="Ejemplo: compra de bolsas al vacío",
+            )
+            c1, c2, c3 = st.columns(3)
+            supplier = c1.text_input("Proveedor")
+            amount = c2.number_input(
+                "Importe",
+                min_value=0.01,
+                step=1.0,
+                format="%.2f",
+            )
+            payment_method = c3.selectbox(
+                "Forma de pago",
+                ["Efectivo", "Transferencia", "Tarjeta", "Crédito", "Otro"],
+            )
+            receipt_reference = st.text_input(
+                "Folio, factura o referencia del comprobante"
+            )
+            notes = st.text_area("Observaciones")
+            if st.form_submit_button("Guardar gasto", type="primary"):
+                if not description.strip():
+                    st.error("Escribe el concepto del gasto.")
+                else:
+                    try:
+                        current_client().table("expenses").insert(
+                            {
+                                "expense_date": expense_date.isoformat(),
+                                "category": category,
+                                "description": description.strip(),
+                                "supplier": supplier.strip(),
+                                "amount": float(amount),
+                                "payment_method": payment_method,
+                                "receipt_reference": receipt_reference.strip(),
+                                "notes": notes,
+                            }
+                        ).execute()
+                        st.success("Gasto guardado permanentemente.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(f"No fue posible guardar el gasto: {exc}")
+
+    with tab2:
+        c1, c2 = st.columns(2)
+        start = c1.date_input(
+            "Desde",
+            date.today().replace(day=1),
+            key="expense_history_start",
+        )
+        end = c2.date_input(
+            "Hasta",
+            date.today(),
+            key="expense_history_end",
+        )
+        expenses = get_expenses(start, end)
+        if not expenses:
+            st.info("No hay gastos en el periodo.")
+        else:
+            df = pd.DataFrame(expenses)
+            st.metric("Total de gastos", money(df["amount"].astype(float).sum()))
+            columns = [
+                "expense_date",
+                "category",
+                "description",
+                "supplier",
+                "amount",
+                "payment_method",
+                "receipt_reference",
+                "notes",
+            ]
+            st.dataframe(df[columns], use_container_width=True, hide_index=True)
+            st.download_button(
+                "Descargar gastos CSV",
+                df[columns].to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"gastos_{start}_{end}.csv",
+                mime="text/csv",
+            )
+
+            expense_map = {
+                f"{row['expense_date']} — {row['description']} — {money(row['amount'])}": row
+                for row in expenses
+            }
+            selected = st.selectbox(
+                "Gasto para editar o eliminar",
+                list(expense_map),
+            )
+            expense = expense_map[selected]
+
+            with st.expander("Editar gasto"):
+                with st.form("edit_expense"):
+                    edit_date = st.date_input(
+                        "Fecha",
+                        date.fromisoformat(expense["expense_date"]),
+                    )
+                    edit_category = st.selectbox(
+                        "Categoría",
+                        categories,
+                        index=categories.index(expense["category"])
+                        if expense["category"] in categories
+                        else len(categories) - 1,
+                    )
+                    edit_description = st.text_input(
+                        "Concepto",
+                        value=expense["description"],
+                    )
+                    c1, c2, c3 = st.columns(3)
+                    edit_supplier = c1.text_input(
+                        "Proveedor",
+                        value=expense.get("supplier") or "",
+                    )
+                    edit_amount = c2.number_input(
+                        "Importe",
+                        min_value=0.01,
+                        value=float(expense["amount"]),
+                        step=1.0,
+                    )
+                    methods = ["Efectivo", "Transferencia", "Tarjeta", "Crédito", "Otro"]
+                    current_method = expense.get("payment_method") or "Efectivo"
+                    edit_method = c3.selectbox(
+                        "Forma de pago",
+                        methods,
+                        index=methods.index(current_method)
+                        if current_method in methods
+                        else 0,
+                    )
+                    edit_reference = st.text_input(
+                        "Folio o referencia",
+                        value=expense.get("receipt_reference") or "",
+                    )
+                    edit_notes = st.text_area(
+                        "Observaciones",
+                        value=expense.get("notes") or "",
+                    )
+                    if st.form_submit_button("Actualizar gasto", type="primary"):
+                        try:
+                            current_client().table("expenses").update(
+                                {
+                                    "expense_date": edit_date.isoformat(),
+                                    "category": edit_category,
+                                    "description": edit_description.strip(),
+                                    "supplier": edit_supplier.strip(),
+                                    "amount": float(edit_amount),
+                                    "payment_method": edit_method,
+                                    "receipt_reference": edit_reference.strip(),
+                                    "notes": edit_notes,
+                                }
+                            ).eq("id", expense["id"]).execute()
+                            st.success("Gasto actualizado.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(str(exc))
+
+                if st.button(
+                    "Eliminar gasto",
+                    key=f"delete_expense_{expense['id']}",
+                ):
+                    try:
+                        current_client().table("expenses").delete().eq(
+                            "id", expense["id"]
+                        ).execute()
+                        st.success("Gasto eliminado.")
+                        st.rerun()
+                    except Exception as exc:
+                        st.error(str(exc))
+
+    with tab3:
+        c1, c2 = st.columns(2)
+        summary_start = c1.date_input(
+            "Desde",
+            date.today().replace(day=1),
+            key="expense_summary_start",
+        )
+        summary_end = c2.date_input(
+            "Hasta",
+            date.today(),
+            key="expense_summary_end",
+        )
+        expenses = get_expenses(summary_start, summary_end)
+        sales = sales_summary(summary_start, summary_end)
+        expenses_total = sum(float(e.get("amount") or 0) for e in expenses)
+        gross_profit = sum(float(s.get("profit") or 0) for s in sales)
+        estimated_result = gross_profit - expenses_total
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Utilidad bruta", money(gross_profit))
+        c2.metric("Gastos registrados", money(expenses_total))
+        c3.metric("Resultado estimado", money(estimated_result))
+
+        if expenses:
+            df = pd.DataFrame(expenses)
+            by_category = (
+                df.groupby("category", as_index=False)["amount"]
+                .sum()
+                .sort_values("amount", ascending=False)
+            )
+            by_category.columns = ["Categoría", "Total"]
+            st.subheader("Gastos por categoría")
+            st.dataframe(by_category, use_container_width=True, hide_index=True)
+            st.bar_chart(by_category.set_index("Categoría"))
+        else:
+            st.info("No hay gastos registrados en el periodo.")
+
+# ---------------------------------------------------------------------
 # Reportes
 # ---------------------------------------------------------------------
 elif menu == "Reportes":
@@ -1557,33 +1821,42 @@ elif menu == "Reportes":
         end = c3.date_input("Hasta", today)
 
     rows = sales_summary(start, end)
-    if not rows:
-        st.info("No hay ventas en el periodo.")
+    expenses = get_expenses(start, end)
+    if not rows and not expenses:
+        st.info("No hay ventas ni gastos en el periodo.")
     else:
         total = sum(float(r.get("total") or 0) for r in rows)
         kilos = sum(float(r.get("total_kg") or 0) for r in rows)
         profit = sum(float(r.get("profit") or 0) for r in rows)
-        c1, c2, c3 = st.columns(3)
+        expenses_total = sum(float(e.get("amount") or 0) for e in expenses)
+        estimated_result = profit - expenses_total
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Ventas", money(total))
         c2.metric("Kilos", f"{kilos:,.3f}")
         c3.metric("Utilidad bruta", money(profit))
+        c4.metric("Gastos", money(expenses_total))
+        c5.metric("Resultado estimado", money(estimated_result))
 
         df = pd.DataFrame(rows)
         st.subheader("Por cliente")
-        by_client = (
-            df.groupby("client_name", as_index=False)
+        if df.empty:
+            st.info("No hay ventas en el periodo.")
+        else:
+            by_client = (
+                df.groupby("client_name", as_index=False)
             .agg(
                 Kilos=("total_kg", "sum"),
                 Ventas=("total", "sum"),
                 Utilidad=("profit", "sum"),
             )
-            .sort_values("Ventas", ascending=False)
-        )
-        st.dataframe(by_client, use_container_width=True, hide_index=True)
+                .sort_values("Ventas", ascending=False)
+            )
+            st.dataframe(by_client, use_container_width=True, hide_index=True)
 
         st.subheader("Detalle")
-        st.dataframe(
-            df[
+        if not df.empty:
+            st.dataframe(
+                df[
                 [
                     "folio",
                     "sale_date",
@@ -1595,15 +1868,15 @@ elif menu == "Reportes":
                     "payment_status",
                 ]
             ],
-            use_container_width=True,
-            hide_index=True,
-        )
-        st.download_button(
-            "Descargar reporte CSV",
-            df.to_csv(index=False).encode("utf-8-sig"),
-            file_name=f"ventas_{start}_{end}.csv",
-            mime="text/csv",
-        )
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.download_button(
+                "Descargar reporte CSV",
+                df.to_csv(index=False).encode("utf-8-sig"),
+                file_name=f"ventas_{start}_{end}.csv",
+                mime="text/csv",
+            )
 
 # ---------------------------------------------------------------------
 # Configuración
