@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
+from zoneinfo import ZoneInfo
 from html import escape
 from io import BytesIO
 from pathlib import Path
@@ -196,6 +197,19 @@ Después guarda los cambios y espera el nuevo despliegue.
     st.stop()
 
 
+MEXICO_TZ = ZoneInfo("America/Mexico_City")
+
+
+def mexico_now() -> datetime:
+    """Fecha y hora actuales de la zona centro de México."""
+    return datetime.now(MEXICO_TZ)
+
+
+def mexico_today() -> date:
+    """Fecha actual de México, independiente del servidor."""
+    return mexico_now().date()
+
+
 def money(value: float | int | None) -> str:
     return f"${float(value or 0):,.2f}"
 
@@ -333,7 +347,7 @@ def get_client_price(client_id: str, product: dict[str, Any]) -> float:
 
 
 def next_folio() -> str:
-    year = date.today().year
+    year = mexico_today().year
     rows = records(
         current_client()
         .table("sales")
@@ -818,7 +832,11 @@ with st.sidebar:
 # Inicio
 # ---------------------------------------------------------------------
 if menu == "Inicio":
-    today = date.today()
+    st.caption(
+        f"Fecha y hora local de México: "
+        f"{mexico_now().strftime('%d/%m/%Y %H:%M')}"
+    )
+    today = mexico_today()
     month_start = today.replace(day=1)
     rows = sales_summary(month_start, today)
     products = get_products()
@@ -1299,7 +1317,7 @@ elif menu == "Inventario":
                         ).eq("id", p["id"]).execute()
                         current_client().table("inventory_movements").insert(
                             {
-                                "movement_date": date.today().isoformat(),
+                                "movement_date": mexico_today().isoformat(),
                                 "product_id": p["id"],
                                 "movement_type": movement_type,
                                 "quantity_kg": sign * quantity,
@@ -1347,7 +1365,7 @@ elif menu == "Centro de control":
     st.header("Centro de control")
     st.caption(
         "Consulta ventas, clientes, productos, utilidad, gastos y cobranza "
-        "en un solo lugar."
+        "en un solo lugar. Fechas calculadas con hora de México."
     )
 
     quick_period = st.selectbox(
@@ -1361,7 +1379,7 @@ elif menu == "Centro de control":
         ],
     )
 
-    today = date.today()
+    today = mexico_today()
     if quick_period == "Hoy":
         control_start = today
         control_end = today
@@ -1622,7 +1640,11 @@ elif menu == "Nueva venta":
     c1, c2, c3 = st.columns(3)
     client_label = c1.selectbox("Cliente", list(client_map))
     selected_client = client_map[client_label]
-    sale_date = c2.date_input("Fecha", date.today())
+    sale_date = c2.date_input(
+        "Fecha de la venta",
+        mexico_today(),
+        help="Puedes cambiarla si capturas una venta de otro día.",
+    )
     folio = c3.text_input("Folio", next_folio())
 
     product_map = {
@@ -1936,7 +1958,7 @@ elif menu == "Cuentas por cobrar":
                 current_client().table("payments").insert(
                     {
                         "sale_id": row["id"],
-                        "payment_date": date.today().isoformat(),
+                        "payment_date": mexico_today().isoformat(),
                         "amount": amount,
                         "payment_method": method,
                         "notes": notes,
@@ -1992,7 +2014,11 @@ elif menu == "Gastos":
     with tab_register:
         with st.form("new_expense_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
-            expense_date = c1.date_input("Fecha", date.today())
+            expense_date = c1.date_input(
+                "Fecha del gasto",
+                mexico_today(),
+                help="Selecciona el día real en que se hizo el gasto.",
+            )
             category = c2.selectbox("Categoría", expense_categories)
 
             description = st.text_input(
@@ -2064,12 +2090,12 @@ elif menu == "Gastos":
         c1, c2 = st.columns(2)
         history_start = c1.date_input(
             "Desde",
-            date.today().replace(day=1),
+            mexico_today().replace(day=1),
             key="expense_history_start",
         )
         history_end = c2.date_input(
             "Hasta",
-            date.today(),
+            mexico_today(),
             key="expense_history_end",
         )
 
@@ -2242,12 +2268,12 @@ elif menu == "Gastos":
         c1, c2 = st.columns(2)
         summary_start = c1.date_input(
             "Desde",
-            date.today().replace(day=1),
+            mexico_today().replace(day=1),
             key="expense_summary_start",
         )
         summary_end = c2.date_input(
             "Hasta",
-            date.today(),
+            mexico_today(),
             key="expense_summary_end",
         )
 
@@ -2298,7 +2324,7 @@ elif menu == "Reportes":
         "Periodo",
         ["Este mes", "Mes anterior", "Este año", "Personalizado"],
     )
-    today = date.today()
+    today = mexico_today()
     if quick == "Este mes":
         start, end = today.replace(day=1), today
     elif quick == "Mes anterior":
@@ -2400,6 +2426,10 @@ elif menu == "Reportes":
 # ---------------------------------------------------------------------
 elif menu == "Configuración":
     st.header("Configuración e identidad")
+    st.info(
+        "Zona horaria operativa: America/Mexico_City. "
+        "Ventas, gastos y reportes usan la fecha local de México."
+    )
     st.caption("Estos datos y logotipos quedan guardados permanentemente en Supabase.")
     current = get_business_settings()
     with st.form("business_settings_form"):
