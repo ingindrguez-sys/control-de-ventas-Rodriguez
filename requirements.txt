@@ -1,6 +1,7 @@
-
-streamlit>=1.40
+treamlit>=1.40
 pandas>=2.0
 supabase>=2.10
 Pillow>=10.0
 streamlit-cookies-manager>=0.2.0
+
+
