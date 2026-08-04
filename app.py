@@ -48,8 +48,12 @@ if not cookies.ready():
     st.stop()
 
 
-def persist_auth_tokens(access_token: str, refresh_token: str, email: str = "") -> None:
-    """Guarda en sesión y cookie cifrada los tokens actuales de Supabase."""
+def persist_auth_tokens(
+    access_token: str,
+    refresh_token: str,
+    email: str = "",
+) -> None:
+    """Guarda los tokens actuales de Supabase en sesión y cookie cifrada."""
     st.session_state["sb_access_token"] = access_token
     st.session_state["sb_refresh_token"] = refresh_token
     if email:
@@ -63,7 +67,6 @@ def persist_auth_tokens(access_token: str, refresh_token: str, email: str = "") 
         }
     )
     cookies.save()
-    # El componente escribe la cookie en el navegador de forma asíncrona.
     time.sleep(1.0)
 
 
@@ -112,8 +115,7 @@ def new_supabase_client() -> Client:
             response = client.auth.set_session(access_token, refresh_token)
             session = getattr(response, "session", None)
             if session:
-                # set_session puede renovar el access token y ROTAR el refresh token.
-                # Es indispensable guardar ambos valores nuevos en la cookie.
+                # Supabase puede rotar el refresh token al renovar la sesión.
                 persist_auth_tokens(
                     session.access_token,
                     session.refresh_token,
@@ -241,18 +243,11 @@ def upload_branding_file(uploaded_file: Any, label: str) -> str:
         sb.storage.from_("branding").remove([object_path])
     except Exception:
         pass
-    try:
-        sb.storage.from_("branding").upload(
-            object_path,
-            data,
-            {"content-type": uploaded_file.type or "image/png", "upsert": "true"},
-        )
-    except Exception as exc:
-        raise RuntimeError(
-            "No fue posible subir la imagen. Ejecuta en Supabase el archivo "
-            "actualizacion_storage_branding_v5_4.sql y vuelve a intentarlo. "
-            f"Detalle: {exc}"
-        ) from exc
+    sb.storage.from_("branding").upload(
+        object_path,
+        data,
+        {"content-type": uploaded_file.type or "image/png", "upsert": "true"},
+    )
     result = sb.storage.from_("branding").get_public_url(object_path)
     if isinstance(result, str):
         return result
@@ -333,7 +328,10 @@ def sales_summary(start: date | None = None, end: date | None = None) -> list[di
     return records(query.order("sale_date", desc=True).execute())
 
 
-def get_expenses(start: date | None = None, end: date | None = None) -> list[dict[str, Any]]:
+def get_expenses(
+    start: date | None = None,
+    end: date | None = None,
+) -> list[dict[str, Any]]:
     query = current_client().table("expenses").select("*")
     if start:
         query = query.gte("expense_date", start.isoformat())
@@ -701,7 +699,7 @@ if menu == "Inicio":
     month_start = today.replace(day=1)
     rows = sales_summary(month_start, today)
     products = get_products()
-    expenses = get_expenses(month_start, today)
+    month_expenses = get_expenses(month_start, today)
 
     sales_total = sum(float(r.get("total") or 0) for r in rows)
     kilos = sum(float(r.get("total_kg") or 0) for r in rows)
@@ -712,6 +710,11 @@ if menu == "Inicio":
         if r.get("payment_status") != "Pagada"
     )
     stock = sum(float(p.get("stock_kg") or 0) for p in products)
+    expenses_total = sum(
+        float(expense.get("amount") or 0)
+        for expense in month_expenses
+    )
+    estimated_result = profit - expenses_total
 
     logo_cols = st.columns([1, 1, 4])
     if settings.get("logo_url"):
@@ -729,9 +732,9 @@ if menu == "Inicio":
     c2.metric("Kilos vendidos", f"{kilos:,.2f} kg")
     c3.metric("Utilidad bruta", money(profit))
     c4.metric("Gastos registrados", money(expenses_total))
-    c5.metric("Resultado estimado", money(result_after_expenses))
+    c5.metric("Resultado estimado", money(estimated_result))
     c6.metric("Por cobrar", money(receivable))
-    st.caption(f"Inventario total disponible: {stock:,.2f} kg")
+    st.caption(f"Inventario disponible: {stock:,.2f} kg")
 
     left, right = st.columns(2)
     with left:
@@ -1568,17 +1571,16 @@ elif menu == "Cuentas por cobrar":
 # Gastos
 # ---------------------------------------------------------------------
 elif menu == "Gastos":
-    st.header("Gastos del negocio")
+    st.header("Gastos de Embutidos Rodríguez")
     st.caption(
-        "Registra gastos relacionados con Embutidos Rodríguez. "
-        "El resultado mostrado es una estimación basada en lo capturado."
+        "Registra los gastos relacionados con la producción, venta y "
+        "distribución del chorizo."
     )
 
-    tab1, tab2, tab3 = st.tabs(["Registrar gasto", "Historial", "Resumen"])
-
-    categories = [
+    expense_categories = [
         "Carne y materia prima",
         "Condimentos e ingredientes",
+        "Tripa",
         "Empaque y etiquetas",
         "Gas y energía",
         "Transporte y combustible",
@@ -1590,16 +1592,29 @@ elif menu == "Gastos":
         "Renta",
         "Otros",
     ]
+    payment_methods = [
+        "Efectivo",
+        "Transferencia",
+        "Tarjeta",
+        "Crédito",
+        "Otro",
+    ]
 
-    with tab1:
-        with st.form("expense_form", clear_on_submit=True):
+    tab_register, tab_history, tab_summary = st.tabs(
+        ["Registrar gasto", "Historial", "Resumen"]
+    )
+
+    with tab_register:
+        with st.form("new_expense_form", clear_on_submit=True):
             c1, c2 = st.columns(2)
             expense_date = c1.date_input("Fecha", date.today())
-            category = c2.selectbox("Categoría", categories)
+            category = c2.selectbox("Categoría", expense_categories)
+
             description = st.text_input(
                 "Concepto",
-                placeholder="Ejemplo: compra de bolsas al vacío",
+                placeholder="Ejemplo: bolsas al vacío de 1 kg",
             )
+
             c1, c2, c3 = st.columns(3)
             supplier = c1.text_input("Proveedor")
             amount = c2.number_input(
@@ -1610,13 +1625,21 @@ elif menu == "Gastos":
             )
             payment_method = c3.selectbox(
                 "Forma de pago",
-                ["Efectivo", "Transferencia", "Tarjeta", "Crédito", "Otro"],
+                payment_methods,
             )
+
             receipt_reference = st.text_input(
-                "Folio, factura o referencia del comprobante"
+                "Factura, folio o referencia"
             )
             notes = st.text_area("Observaciones")
-            if st.form_submit_button("Guardar gasto", type="primary"):
+
+            save_expense = st.form_submit_button(
+                "Guardar gasto",
+                type="primary",
+                use_container_width=True,
+            )
+
+            if save_expense:
                 if not description.strip():
                     st.error("Escribe el concepto del gasto.")
                 else:
@@ -1630,7 +1653,7 @@ elif menu == "Gastos":
                                 "amount": float(amount),
                                 "payment_method": payment_method,
                                 "receipt_reference": receipt_reference.strip(),
-                                "notes": notes,
+                                "notes": notes.strip(),
                             }
                         ).execute()
                         st.success("Gasto guardado permanentemente.")
@@ -1638,25 +1661,31 @@ elif menu == "Gastos":
                     except Exception as exc:
                         st.error(f"No fue posible guardar el gasto: {exc}")
 
-    with tab2:
+    with tab_history:
         c1, c2 = st.columns(2)
-        start = c1.date_input(
+        history_start = c1.date_input(
             "Desde",
             date.today().replace(day=1),
             key="expense_history_start",
         )
-        end = c2.date_input(
+        history_end = c2.date_input(
             "Hasta",
             date.today(),
             key="expense_history_end",
         )
-        expenses = get_expenses(start, end)
-        if not expenses:
-            st.info("No hay gastos en el periodo.")
+
+        expense_rows = get_expenses(history_start, history_end)
+
+        if not expense_rows:
+            st.info("No hay gastos registrados en el periodo.")
         else:
-            df = pd.DataFrame(expenses)
-            st.metric("Total de gastos", money(df["amount"].astype(float).sum()))
-            columns = [
+            expense_df = pd.DataFrame(expense_rows)
+            st.metric(
+                "Total de gastos",
+                money(expense_df["amount"].astype(float).sum()),
+            )
+
+            visible_columns = [
                 "expense_date",
                 "category",
                 "description",
@@ -1666,102 +1695,147 @@ elif menu == "Gastos":
                 "receipt_reference",
                 "notes",
             ]
-            st.dataframe(df[columns], use_container_width=True, hide_index=True)
+            st.dataframe(
+                expense_df[visible_columns],
+                use_container_width=True,
+                hide_index=True,
+            )
+
             st.download_button(
                 "Descargar gastos CSV",
-                df[columns].to_csv(index=False).encode("utf-8-sig"),
-                file_name=f"gastos_{start}_{end}.csv",
+                expense_df[visible_columns]
+                .to_csv(index=False)
+                .encode("utf-8-sig"),
+                file_name=f"gastos_{history_start}_{history_end}.csv",
                 mime="text/csv",
+                use_container_width=True,
             )
 
-            expense_map = {
-                f"{row['expense_date']} — {row['description']} — {money(row['amount'])}": row
-                for row in expenses
+            expense_options = {
+                (
+                    f"{row['expense_date']} — {row['description']} — "
+                    f"{money(row['amount'])}"
+                ): row
+                for row in expense_rows
             }
-            selected = st.selectbox(
-                "Gasto para editar o eliminar",
-                list(expense_map),
+            selected_expense_label = st.selectbox(
+                "Selecciona un gasto para editar",
+                list(expense_options),
             )
-            expense = expense_map[selected]
+            selected_expense = expense_options[selected_expense_label]
 
-            with st.expander("Editar gasto"):
-                with st.form("edit_expense"):
+            with st.expander("Editar o eliminar gasto"):
+                with st.form("edit_expense_form"):
                     edit_date = st.date_input(
                         "Fecha",
-                        date.fromisoformat(expense["expense_date"]),
+                        date.fromisoformat(
+                            selected_expense["expense_date"]
+                        ),
+                    )
+                    current_category = selected_expense.get(
+                        "category", "Otros"
                     )
                     edit_category = st.selectbox(
                         "Categoría",
-                        categories,
-                        index=categories.index(expense["category"])
-                        if expense["category"] in categories
-                        else len(categories) - 1,
+                        expense_categories,
+                        index=(
+                            expense_categories.index(current_category)
+                            if current_category in expense_categories
+                            else len(expense_categories) - 1
+                        ),
                     )
                     edit_description = st.text_input(
                         "Concepto",
-                        value=expense["description"],
+                        value=selected_expense.get("description") or "",
                     )
+
                     c1, c2, c3 = st.columns(3)
                     edit_supplier = c1.text_input(
                         "Proveedor",
-                        value=expense.get("supplier") or "",
+                        value=selected_expense.get("supplier") or "",
                     )
                     edit_amount = c2.number_input(
                         "Importe",
                         min_value=0.01,
-                        value=float(expense["amount"]),
+                        value=float(selected_expense.get("amount") or 0.01),
                         step=1.0,
+                        format="%.2f",
                     )
-                    methods = ["Efectivo", "Transferencia", "Tarjeta", "Crédito", "Otro"]
-                    current_method = expense.get("payment_method") or "Efectivo"
-                    edit_method = c3.selectbox(
+                    current_method = selected_expense.get(
+                        "payment_method", "Efectivo"
+                    )
+                    edit_payment_method = c3.selectbox(
                         "Forma de pago",
-                        methods,
-                        index=methods.index(current_method)
-                        if current_method in methods
-                        else 0,
+                        payment_methods,
+                        index=(
+                            payment_methods.index(current_method)
+                            if current_method in payment_methods
+                            else 0
+                        ),
                     )
+
                     edit_reference = st.text_input(
-                        "Folio o referencia",
-                        value=expense.get("receipt_reference") or "",
+                        "Factura, folio o referencia",
+                        value=(
+                            selected_expense.get("receipt_reference")
+                            or ""
+                        ),
                     )
                     edit_notes = st.text_area(
                         "Observaciones",
-                        value=expense.get("notes") or "",
+                        value=selected_expense.get("notes") or "",
                     )
-                    if st.form_submit_button("Actualizar gasto", type="primary"):
-                        try:
-                            current_client().table("expenses").update(
-                                {
-                                    "expense_date": edit_date.isoformat(),
-                                    "category": edit_category,
-                                    "description": edit_description.strip(),
-                                    "supplier": edit_supplier.strip(),
-                                    "amount": float(edit_amount),
-                                    "payment_method": edit_method,
-                                    "receipt_reference": edit_reference.strip(),
-                                    "notes": edit_notes,
-                                }
-                            ).eq("id", expense["id"]).execute()
-                            st.success("Gasto actualizado.")
-                            st.rerun()
-                        except Exception as exc:
-                            st.error(str(exc))
 
+                    update_expense = st.form_submit_button(
+                        "Actualizar gasto",
+                        type="primary",
+                    )
+
+                    if update_expense:
+                        if not edit_description.strip():
+                            st.error("El concepto no puede quedar vacío.")
+                        else:
+                            try:
+                                current_client().table("expenses").update(
+                                    {
+                                        "expense_date": edit_date.isoformat(),
+                                        "category": edit_category,
+                                        "description": edit_description.strip(),
+                                        "supplier": edit_supplier.strip(),
+                                        "amount": float(edit_amount),
+                                        "payment_method": edit_payment_method,
+                                        "receipt_reference": (
+                                            edit_reference.strip()
+                                        ),
+                                        "notes": edit_notes.strip(),
+                                    }
+                                ).eq(
+                                    "id", selected_expense["id"]
+                                ).execute()
+                                st.success("Gasto actualizado.")
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(str(exc))
+
+                delete_confirm = st.checkbox(
+                    "Confirmo que deseo eliminar este gasto",
+                    key=f"confirm_delete_{selected_expense['id']}",
+                )
                 if st.button(
                     "Eliminar gasto",
-                    key=f"delete_expense_{expense['id']}",
+                    disabled=not delete_confirm,
+                    key=f"delete_expense_{selected_expense['id']}",
                 ):
                     try:
                         current_client().table("expenses").delete().eq(
-                            "id", expense["id"]
+                            "id", selected_expense["id"]
                         ).execute()
                         st.success("Gasto eliminado.")
                         st.rerun()
                     except Exception as exc:
                         st.error(str(exc))
 
-    with tab3:
+    with tab_summary:
         c1, c2 = st.columns(2)
         summary_start = c1.date_input(
             "Desde",
@@ -1773,27 +1847,40 @@ elif menu == "Gastos":
             date.today(),
             key="expense_summary_end",
         )
-        expenses = get_expenses(summary_start, summary_end)
-        sales = sales_summary(summary_start, summary_end)
-        expenses_total = sum(float(e.get("amount") or 0) for e in expenses)
-        gross_profit = sum(float(s.get("profit") or 0) for s in sales)
-        estimated_result = gross_profit - expenses_total
+
+        summary_expenses = get_expenses(summary_start, summary_end)
+        summary_sales = sales_summary(summary_start, summary_end)
+
+        total_expenses = sum(
+            float(row.get("amount") or 0)
+            for row in summary_expenses
+        )
+        gross_profit = sum(
+            float(row.get("profit") or 0)
+            for row in summary_sales
+        )
+        result_estimate = gross_profit - total_expenses
 
         c1, c2, c3 = st.columns(3)
         c1.metric("Utilidad bruta", money(gross_profit))
-        c2.metric("Gastos registrados", money(expenses_total))
-        c3.metric("Resultado estimado", money(estimated_result))
+        c2.metric("Gastos registrados", money(total_expenses))
+        c3.metric("Resultado estimado", money(result_estimate))
 
-        if expenses:
-            df = pd.DataFrame(expenses)
+        if summary_expenses:
+            summary_df = pd.DataFrame(summary_expenses)
             by_category = (
-                df.groupby("category", as_index=False)["amount"]
+                summary_df.groupby("category", as_index=False)["amount"]
                 .sum()
                 .sort_values("amount", ascending=False)
             )
             by_category.columns = ["Categoría", "Total"]
+
             st.subheader("Gastos por categoría")
-            st.dataframe(by_category, use_container_width=True, hide_index=True)
+            st.dataframe(
+                by_category,
+                use_container_width=True,
+                hide_index=True,
+            )
             st.bar_chart(by_category.set_index("Categoría"))
         else:
             st.info("No hay gastos registrados en el periodo.")
@@ -1821,61 +1908,88 @@ elif menu == "Reportes":
         end = c3.date_input("Hasta", today)
 
     rows = sales_summary(start, end)
-    expenses = get_expenses(start, end)
-    if not rows and not expenses:
+    report_expenses = get_expenses(start, end)
+
+    if not rows and not report_expenses:
         st.info("No hay ventas ni gastos en el periodo.")
     else:
         total = sum(float(r.get("total") or 0) for r in rows)
         kilos = sum(float(r.get("total_kg") or 0) for r in rows)
         profit = sum(float(r.get("profit") or 0) for r in rows)
-        expenses_total = sum(float(e.get("amount") or 0) for e in expenses)
-        estimated_result = profit - expenses_total
+        expense_total = sum(
+            float(expense.get("amount") or 0)
+            for expense in report_expenses
+        )
+        estimated_result = profit - expense_total
+
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Ventas", money(total))
         c2.metric("Kilos", f"{kilos:,.3f}")
         c3.metric("Utilidad bruta", money(profit))
-        c4.metric("Gastos", money(expenses_total))
+        c4.metric("Gastos", money(expense_total))
         c5.metric("Resultado estimado", money(estimated_result))
 
-        df = pd.DataFrame(rows)
-        st.subheader("Por cliente")
-        if df.empty:
-            st.info("No hay ventas en el periodo.")
-        else:
+        if rows:
+            df = pd.DataFrame(rows)
+
+            st.subheader("Por cliente")
             by_client = (
                 df.groupby("client_name", as_index=False)
-            .agg(
-                Kilos=("total_kg", "sum"),
-                Ventas=("total", "sum"),
-                Utilidad=("profit", "sum"),
-            )
+                .agg(
+                    Kilos=("total_kg", "sum"),
+                    Ventas=("total", "sum"),
+                    Utilidad=("profit", "sum"),
+                )
                 .sort_values("Ventas", ascending=False)
             )
-            st.dataframe(by_client, use_container_width=True, hide_index=True)
+            st.dataframe(
+                by_client,
+                use_container_width=True,
+                hide_index=True,
+            )
 
-        st.subheader("Detalle")
-        if not df.empty:
+            st.subheader("Detalle de ventas")
             st.dataframe(
                 df[
-                [
-                    "folio",
-                    "sale_date",
-                    "client_name",
-                    "total_kg",
-                    "total",
-                    "profit",
-                    "paid_amount",
-                    "payment_status",
-                ]
-            ],
+                    [
+                        "folio",
+                        "sale_date",
+                        "client_name",
+                        "total_kg",
+                        "total",
+                        "profit",
+                        "paid_amount",
+                        "payment_status",
+                    ]
+                ],
                 use_container_width=True,
                 hide_index=True,
             )
             st.download_button(
-                "Descargar reporte CSV",
+                "Descargar ventas CSV",
                 df.to_csv(index=False).encode("utf-8-sig"),
                 file_name=f"ventas_{start}_{end}.csv",
                 mime="text/csv",
+            )
+        else:
+            st.info("No hay ventas en el periodo seleccionado.")
+
+        if report_expenses:
+            expense_df = pd.DataFrame(report_expenses)
+            st.subheader("Detalle de gastos")
+            st.dataframe(
+                expense_df[
+                    [
+                        "expense_date",
+                        "category",
+                        "description",
+                        "supplier",
+                        "amount",
+                        "payment_method",
+                    ]
+                ],
+                use_container_width=True,
+                hide_index=True,
             )
 
 # ---------------------------------------------------------------------
@@ -1913,8 +2027,8 @@ elif menu == "Configuración":
                 st.rerun()
             except Exception as exc:
                 st.error(
-                    "No fue posible guardar la configuración. Ejecuta primero el archivo "
-                    f"actualizacion_v5_1.sql en Supabase. Detalle: {exc}"
+                    "No fue posible guardar la configuración. Ejecuta el archivo "
+                    f"actualizacion_v6_0.sql en Supabase. Detalle: {exc}"
                 )
 
     c1, c2 = st.columns(2)
