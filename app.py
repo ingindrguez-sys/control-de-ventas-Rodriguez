@@ -2,11 +2,16 @@ from __future__ import annotations
 
 from datetime import date, timedelta
 from html import escape
+from io import BytesIO
+from pathlib import Path
 from typing import Any
+import json
 
 import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
+from PIL import Image, ImageDraw, ImageFont
+from streamlit_cookies_manager import EncryptedCookieManager
 from supabase import Client, create_client
 
 st.set_page_config(
@@ -32,6 +37,53 @@ SUPABASE_KEY = (
     get_secret("SUPABASE_PUBLISHABLE_KEY")
     or get_secret("SUPABASE_ANON_KEY")
 )
+COOKIE_PASSWORD = get_secret("COOKIE_PASSWORD")
+
+cookies = EncryptedCookieManager(
+    prefix="embutidos-rodriguez/",
+    password=COOKIE_PASSWORD or "configura-cookie-password",
+)
+if not cookies.ready():
+    st.stop()
+
+
+def hydrate_auth_from_cookie() -> None:
+    """Recupera la sesión de Supabase desde una cookie cifrada persistente."""
+    if st.session_state.get("sb_access_token"):
+        return
+    raw = cookies.get("supabase_session")
+    if not raw:
+        return
+    try:
+        payload = json.loads(raw)
+        access_token = payload.get("access_token")
+        refresh_token = payload.get("refresh_token")
+        email = payload.get("email", "")
+        if access_token and refresh_token:
+            client = create_client(SUPABASE_URL, SUPABASE_KEY)
+            refreshed = client.auth.set_session(access_token, refresh_token)
+            session = getattr(refreshed, "session", None)
+            user = getattr(refreshed, "user", None)
+            if session:
+                st.session_state["sb_access_token"] = session.access_token
+                st.session_state["sb_refresh_token"] = session.refresh_token
+                st.session_state["sb_user_email"] = (
+                    getattr(user, "email", None) or email
+                )
+                cookies["supabase_session"] = json.dumps(
+                    {
+                        "access_token": session.access_token,
+                        "refresh_token": session.refresh_token,
+                        "email": st.session_state["sb_user_email"],
+                    }
+                )
+                cookies.save()
+    except Exception:
+        try:
+            del cookies["supabase_session"]
+            cookies.save()
+        except Exception:
+            pass
 
 
 def new_supabase_client() -> Client:
@@ -45,7 +97,11 @@ def new_supabase_client() -> Client:
     refresh_token = st.session_state.get("sb_refresh_token")
     if access_token and refresh_token:
         try:
-            client.auth.set_session(access_token, refresh_token)
+            response = client.auth.set_session(access_token, refresh_token)
+            session = getattr(response, "session", None)
+            if session:
+                st.session_state["sb_access_token"] = session.access_token
+                st.session_state["sb_refresh_token"] = session.refresh_token
         except Exception:
             clear_auth()
     return client
@@ -59,6 +115,12 @@ def clear_auth() -> None:
         "cart",
     ):
         st.session_state.pop(key, None)
+    try:
+        if "supabase_session" in cookies:
+            del cookies["supabase_session"]
+            cookies.save()
+    except Exception:
+        pass
 
 
 def save_auth(response: Any) -> None:
@@ -67,7 +129,17 @@ def save_auth(response: Any) -> None:
     if session:
         st.session_state["sb_access_token"] = session.access_token
         st.session_state["sb_refresh_token"] = session.refresh_token
-    if user:
+        email = getattr(user, "email", None) or ""
+        st.session_state["sb_user_email"] = email
+        cookies["supabase_session"] = json.dumps(
+            {
+                "access_token": session.access_token,
+                "refresh_token": session.refresh_token,
+                "email": email,
+            }
+        )
+        cookies.save()
+    elif user:
         st.session_state["sb_user_email"] = user.email
 
 
@@ -77,9 +149,8 @@ def is_logged_in() -> bool:
         and st.session_state.get("sb_refresh_token")
     )
 
-
 def require_configuration() -> None:
-    if SUPABASE_URL and SUPABASE_KEY:
+    if SUPABASE_URL and SUPABASE_KEY and COOKIE_PASSWORD:
         return
     st.error("La aplicación todavía no está conectada a Supabase.")
     st.markdown(
@@ -90,6 +161,7 @@ pega:
 ```toml
 SUPABASE_URL = "https://TU-PROYECTO.supabase.co"
 SUPABASE_PUBLISHABLE_KEY = "sb_publishable_TU_CLAVE"
+COOKIE_PASSWORD = "UNA_CLAVE_LARGA_Y_PRIVADA"
 ```
 
 Después guarda los cambios y espera el nuevo despliegue.
@@ -334,6 +406,145 @@ def build_ticket_html(sale_id: str, paper_width: str, show_prices: bool) -> str:
 </div></body></html>"""
 
 
+
+def _load_ticket_font(size: int, bold: bool = False) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    candidates = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/liberation2/LiberationSans-Bold.ttf" if bold
+        else "/usr/share/fonts/truetype/liberation2/LiberationSans-Regular.ttf",
+    ]
+    for candidate in candidates:
+        try:
+            return ImageFont.truetype(candidate, size=size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _wrap_text(draw: ImageDraw.ImageDraw, text_value: str, font: Any, max_width: int) -> list[str]:
+    words = str(text_value).split()
+    if not words:
+        return [""]
+    lines: list[str] = []
+    current = words[0]
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if draw.textbbox((0, 0), trial, font=font)[2] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def build_ticket_png(sale_id: str, show_prices: bool = True) -> bytes:
+    """Genera un ticket PNG monocromático optimizado para papel térmico de 58 mm."""
+    sale, items = sale_detail(sale_id)
+    if not sale:
+        raise RuntimeError("Venta no encontrada.")
+
+    settings = get_business_settings()
+    client = sale.get("clients") or {}
+    width = 384
+    margin = 18
+    usable = width - (margin * 2)
+
+    font_small = _load_ticket_font(18)
+    font_regular = _load_ticket_font(21)
+    font_bold = _load_ticket_font(22, bold=True)
+    font_title = _load_ticket_font(28, bold=True)
+    font_total = _load_ticket_font(27, bold=True)
+
+    # Calcular altura dinámica.
+    estimated_lines = 14 + len(items) * (4 if show_prices else 3)
+    height = max(700, estimated_lines * 32 + 220)
+    image = Image.new("L", (width, height), 255)
+    draw = ImageDraw.Draw(image)
+    y = 18
+
+    def center(text_value: str, font: Any, gap: int = 5) -> None:
+        nonlocal y
+        for line in _wrap_text(draw, text_value, font, usable):
+            box = draw.textbbox((0, 0), line, font=font)
+            x = (width - (box[2] - box[0])) // 2
+            draw.text((x, y), line, font=font, fill=0)
+            y += (box[3] - box[1]) + gap
+
+    def left(text_value: str, font: Any = font_regular, gap: int = 5) -> None:
+        nonlocal y
+        for line in _wrap_text(draw, text_value, font, usable):
+            draw.text((margin, y), line, font=font, fill=0)
+            box = draw.textbbox((0, 0), line, font=font)
+            y += (box[3] - box[1]) + gap
+
+    def rule() -> None:
+        nonlocal y
+        draw.line((margin, y, width - margin, y), fill=0, width=2)
+        y += 12
+
+    center(str(settings.get("business_name") or "EMBUTIDOS RODRÍGUEZ").upper(), font_title)
+    slogan = str(settings.get("slogan") or "")
+    if slogan:
+        center(slogan, font_small)
+    center("TICKET DE VENTA / ENTREGA", font_small)
+    rule()
+
+    left(f"Folio: {sale.get('folio', '')}", font_bold)
+    left(f"Fecha: {sale.get('sale_date', '')}")
+    left(f"Cliente: {client.get('business_name', '')}")
+    left(
+        f"Pago: {sale.get('payment_status', '')} · {sale.get('payment_method') or ''}",
+        font_small,
+    )
+    rule()
+
+    total_kg = 0.0
+    total = 0.0
+    for item in items:
+        product = item.get("products") or {}
+        name = str(product.get("name") or "Producto")
+        presentation = str(product.get("presentation") or "")
+        kg = float(item.get("weight_kg") or 0)
+        units = float(item.get("quantity_units") or 0)
+        price = float(item.get("price_per_kg") or 0)
+        subtotal = float(item.get("subtotal") or 0)
+        total_kg += kg
+        total += subtotal
+
+        left(name, font_bold)
+        left(f"{presentation} · {units:g} unidad(es)", font_small)
+        if show_prices:
+            left(f"{kg:.3f} kg x {money(price)} = {money(subtotal)}", font_regular)
+        else:
+            left(f"{kg:.3f} kg", font_regular)
+        y += 7
+
+    rule()
+    left(f"TOTAL KG: {total_kg:.3f} kg", font_bold)
+    if show_prices:
+        left(f"TOTAL: {money(total)}", font_total)
+
+    notes = str(sale.get("notes") or "").strip()
+    if notes:
+        rule()
+        left(f"Observaciones: {notes}", font_small)
+
+    y += 35
+    draw.line((70, y, width - 70, y), fill=0, width=2)
+    y += 8
+    center("RECIBÍ DE CONFORMIDAD", font_small)
+    y += 12
+    center("Gracias por su compra", font_small)
+
+    # Recortar el espacio sobrante.
+    final_height = min(height, y + 24)
+    image = image.crop((0, 0, width, final_height))
+    output = BytesIO()
+    image.save(output, format="PNG", optimize=True)
+    return output.getvalue()
+
 # ---------------------------------------------------------------------
 # Apariencia
 # ---------------------------------------------------------------------
@@ -354,6 +565,7 @@ div[data-testid="stMetric"] {background:white;border:1px solid #eadfdb;padding:1
 )
 
 require_configuration()
+hydrate_auth_from_cookie()
 
 # ---------------------------------------------------------------------
 # Inicio de sesión
@@ -1214,12 +1426,29 @@ elif menu == "Tickets":
             options[selected], paper, kind == "Ticket con precios"
         )
         components.html(ticket, height=720, scrolling=True)
-        st.download_button(
-            "Descargar ticket HTML",
+        sale_id = options[selected]
+        folio_ticket = selected.split(" — ")[0]
+        png_ticket = build_ticket_png(
+            sale_id, show_prices=kind == "Ticket con precios"
+        )
+        c1, c2 = st.columns(2)
+        c1.download_button(
+            "Descargar PNG 58 mm",
+            png_ticket,
+            file_name=f"ticket_{folio_ticket}_58mm.png",
+            mime="image/png",
+            use_container_width=True,
+        )
+        c2.download_button(
+            "Descargar HTML",
             ticket.encode("utf-8"),
-            file_name=f"ticket_{selected.split(' — ')[0]}.html",
+            file_name=f"ticket_{folio_ticket}.html",
             mime="text/html",
             use_container_width=True,
+        )
+        st.caption(
+            "En iPhone: descarga el PNG, ábrelo, pulsa Compartir y selecciona "
+            "BR RawPrinter para enviarlo a la PT-210."
         )
 
 # ---------------------------------------------------------------------
