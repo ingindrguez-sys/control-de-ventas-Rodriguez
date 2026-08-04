@@ -388,6 +388,84 @@ def get_expenses(
         return []
 
 
+def get_sale_items_for_period(
+    start: date,
+    end: date,
+) -> list[dict[str, Any]]:
+    """Devuelve partidas de venta con producto y cliente para análisis."""
+    try:
+        response = (
+            current_client()
+            .table("sale_items")
+            .select(
+                "id, sale_id, product_id, weight_kg, quantity_units, "
+                "price_per_kg, cost_per_kg, subtotal, cost_total, profit, "
+                "sales!inner(id, sale_date, client_id, total, payment_status, "
+                "clients(business_name)), "
+                "products(name, presentation)"
+            )
+            .gte("sales.sale_date", start.isoformat())
+            .lte("sales.sale_date", end.isoformat())
+            .execute()
+        )
+        return records(response)
+    except Exception:
+        return []
+
+
+def analytics_frames(
+    start: date,
+    end: date,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Prepara tablas por día, cliente y producto."""
+    sales_rows = sales_summary(start, end)
+    item_rows = get_sale_items_for_period(start, end)
+
+    sales_df = pd.DataFrame(sales_rows)
+    items_flat: list[dict[str, Any]] = []
+
+    for row in item_rows:
+        sale = row.get("sales") or {}
+        client = sale.get("clients") or {}
+        product = row.get("products") or {}
+        items_flat.append(
+            {
+                "Fecha": sale.get("sale_date"),
+                "Cliente": client.get("business_name") or "Sin cliente",
+                "Producto": product.get("name") or "Producto",
+                "Presentación": product.get("presentation") or "",
+                "Kilos": float(row.get("weight_kg") or 0),
+                "Unidades": float(row.get("quantity_units") or 0),
+                "Ventas": float(row.get("subtotal") or 0),
+                "Costo": float(row.get("cost_total") or 0),
+                "Utilidad": float(row.get("profit") or 0),
+            }
+        )
+
+    items_df = pd.DataFrame(items_flat)
+
+    if sales_df.empty:
+        daily_df = pd.DataFrame(
+            columns=["Fecha", "Ventas", "Kilos", "Utilidad", "Cobrado"]
+        )
+    else:
+        working = sales_df.copy()
+        working["sale_date"] = working["sale_date"].astype(str)
+        daily_df = (
+            working.groupby("sale_date", as_index=False)
+            .agg(
+                Ventas=("total", "sum"),
+                Kilos=("total_kg", "sum"),
+                Utilidad=("profit", "sum"),
+                Cobrado=("paid_amount", "sum"),
+            )
+            .rename(columns={"sale_date": "Fecha"})
+            .sort_values("Fecha")
+        )
+
+    return daily_df, sales_df, items_df
+
+
 def sale_detail(sale_id: str) -> tuple[dict[str, Any] | None, list[dict[str, Any]]]:
     sales = records(
         current_client()
@@ -715,6 +793,7 @@ with st.sidebar:
         "Menú",
         [
             "Inicio",
+            "Centro de control",
             "Nueva venta",
             "Tickets",
             "Inventario",
@@ -1260,6 +1339,268 @@ elif menu == "Inventario":
                     }
                 )
             st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+# ---------------------------------------------------------------------
+# Centro de control
+# ---------------------------------------------------------------------
+elif menu == "Centro de control":
+    st.header("Centro de control")
+    st.caption(
+        "Consulta ventas, clientes, productos, utilidad, gastos y cobranza "
+        "en un solo lugar."
+    )
+
+    quick_period = st.selectbox(
+        "Periodo",
+        [
+            "Hoy",
+            "Esta semana",
+            "Este mes",
+            "Últimos 30 días",
+            "Personalizado",
+        ],
+    )
+
+    today = date.today()
+    if quick_period == "Hoy":
+        control_start = today
+        control_end = today
+    elif quick_period == "Esta semana":
+        control_start = today - timedelta(days=today.weekday())
+        control_end = today
+    elif quick_period == "Este mes":
+        control_start = today.replace(day=1)
+        control_end = today
+    elif quick_period == "Últimos 30 días":
+        control_start = today - timedelta(days=29)
+        control_end = today
+    else:
+        c1, c2 = st.columns(2)
+        control_start = c1.date_input(
+            "Desde",
+            today.replace(day=1),
+            key="control_start",
+        )
+        control_end = c2.date_input(
+            "Hasta",
+            today,
+            key="control_end",
+        )
+
+    daily_df, sales_df, items_df = analytics_frames(
+        control_start,
+        control_end,
+    )
+    control_expenses = get_expenses(control_start, control_end)
+
+    total_sales = (
+        float(sales_df["total"].astype(float).sum())
+        if not sales_df.empty
+        else 0.0
+    )
+    total_kilos = (
+        float(sales_df["total_kg"].astype(float).sum())
+        if not sales_df.empty
+        else 0.0
+    )
+    gross_profit = (
+        float(sales_df["profit"].astype(float).sum())
+        if not sales_df.empty
+        else 0.0
+    )
+    total_paid = (
+        float(sales_df["paid_amount"].astype(float).sum())
+        if not sales_df.empty
+        else 0.0
+    )
+    total_expenses = sum(
+        float(row.get("amount") or 0)
+        for row in control_expenses
+    )
+    estimated_result = gross_profit - total_expenses
+    receivable = max(total_sales - total_paid, 0)
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Ventas", money(total_sales))
+    c2.metric("Kilos vendidos", f"{total_kilos:,.2f} kg")
+    c3.metric("Utilidad bruta", money(gross_profit))
+    c4.metric("Gastos", money(total_expenses))
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Resultado estimado", money(estimated_result))
+    c2.metric("Cobrado", money(total_paid))
+    c3.metric("Por cobrar", money(receivable))
+
+    if not daily_df.empty:
+        st.subheader("Ventas por día")
+        daily_chart = daily_df.set_index("Fecha")[["Ventas"]]
+        st.bar_chart(daily_chart)
+
+    tab_clients, tab_products, tab_finance, tab_inventory = st.tabs(
+        [
+            "Clientes",
+            "Productos",
+            "Finanzas",
+            "Inventario",
+        ]
+    )
+
+    with tab_clients:
+        st.subheader("Ventas por cliente")
+        if sales_df.empty:
+            st.info("No hay ventas en el periodo.")
+        else:
+            client_summary = (
+                sales_df.groupby("client_name", as_index=False)
+                .agg(
+                    Ventas=("total", "sum"),
+                    Kilos=("total_kg", "sum"),
+                    Utilidad=("profit", "sum"),
+                    Cobrado=("paid_amount", "sum"),
+                )
+                .sort_values("Ventas", ascending=False)
+            )
+            client_summary["Por cobrar"] = (
+                client_summary["Ventas"] - client_summary["Cobrado"]
+            )
+            st.dataframe(
+                client_summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.bar_chart(
+                client_summary.set_index("client_name")[["Ventas"]]
+            )
+            st.download_button(
+                "Descargar ventas por cliente CSV",
+                client_summary.to_csv(index=False).encode("utf-8-sig"),
+                file_name=(
+                    f"ventas_por_cliente_{control_start}_{control_end}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    with tab_products:
+        st.subheader("Ventas por producto")
+        if items_df.empty:
+            st.info("No hay partidas de productos en el periodo.")
+        else:
+            product_summary = (
+                items_df.groupby(
+                    ["Producto", "Presentación"],
+                    as_index=False,
+                )
+                .agg(
+                    Kilos=("Kilos", "sum"),
+                    Unidades=("Unidades", "sum"),
+                    Ventas=("Ventas", "sum"),
+                    Costo=("Costo", "sum"),
+                    Utilidad=("Utilidad", "sum"),
+                )
+                .sort_values("Ventas", ascending=False)
+            )
+            product_summary["Margen %"] = product_summary.apply(
+                lambda row: (
+                    (row["Utilidad"] / row["Ventas"]) * 100
+                    if row["Ventas"]
+                    else 0
+                ),
+                axis=1,
+            )
+            st.dataframe(
+                product_summary,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.bar_chart(
+                product_summary.set_index("Producto")[["Kilos"]]
+            )
+            st.download_button(
+                "Descargar ventas por producto CSV",
+                product_summary.to_csv(index=False).encode("utf-8-sig"),
+                file_name=(
+                    f"ventas_por_producto_{control_start}_{control_end}.csv"
+                ),
+                mime="text/csv",
+                use_container_width=True,
+            )
+
+    with tab_finance:
+        st.subheader("Resumen financiero")
+        financial_rows = pd.DataFrame(
+            [
+                {"Concepto": "Ventas", "Importe": total_sales},
+                {"Concepto": "Costo de producto", "Importe": total_sales - gross_profit},
+                {"Concepto": "Utilidad bruta", "Importe": gross_profit},
+                {"Concepto": "Gastos registrados", "Importe": total_expenses},
+                {"Concepto": "Resultado estimado", "Importe": estimated_result},
+                {"Concepto": "Cobrado", "Importe": total_paid},
+                {"Concepto": "Por cobrar", "Importe": receivable},
+            ]
+        )
+        st.dataframe(
+            financial_rows,
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        if control_expenses:
+            expenses_df = pd.DataFrame(control_expenses)
+            expense_category = (
+                expenses_df.groupby("category", as_index=False)["amount"]
+                .sum()
+                .sort_values("amount", ascending=False)
+            )
+            expense_category.columns = ["Categoría", "Total"]
+            st.subheader("Gastos por categoría")
+            st.dataframe(
+                expense_category,
+                use_container_width=True,
+                hide_index=True,
+            )
+            st.bar_chart(
+                expense_category.set_index("Categoría")[["Total"]]
+            )
+        else:
+            st.info("No hay gastos registrados en el periodo.")
+
+    with tab_inventory:
+        st.subheader("Alertas de inventario")
+        products = get_products()
+        low_stock = [
+            product
+            for product in products
+            if float(product.get("stock_kg") or 0)
+            <= float(product.get("min_stock_kg") or 0)
+        ]
+        if not low_stock:
+            st.success("No hay productos por debajo del inventario mínimo.")
+        else:
+            low_df = pd.DataFrame(low_stock)
+            visible = [
+                "name",
+                "presentation",
+                "stock_kg",
+                "min_stock_kg",
+                "sale_price",
+                "cost_per_kg",
+            ]
+            available = [
+                column
+                for column in visible
+                if column in low_df.columns
+            ]
+            st.dataframe(
+                low_df[available],
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    st.caption(
+        "Resultado estimado = utilidad bruta menos gastos registrados. "
+        "No incluye impuestos ni ajustes contables no capturados."
+    )
 
 # ---------------------------------------------------------------------
 # Nueva venta
