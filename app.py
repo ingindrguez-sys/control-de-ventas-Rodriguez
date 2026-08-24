@@ -13,6 +13,17 @@ import pandas as pd
 import streamlit as st
 import streamlit.components.v1 as components
 from PIL import Image, ImageDraw, ImageFont
+
+# Compatibilidad con streamlit-cookies-manager 0.2.0.
+#
+# Streamlit 1.38 eliminó el decorador histórico ``st.cache``. La librería de
+# cookies todavía lo usa al importarse, por lo que en versiones actuales de
+# Streamlit la aplicación terminaba con AttributeError antes de poder mostrar
+# el inicio de sesión. El administrador de cookies es un recurso (no un dato
+# serializable), así que ``st.cache_resource`` es el reemplazo correcto.
+if not hasattr(st, "cache"):
+    st.cache = st.cache_resource  # type: ignore[attr-defined]
+
 from streamlit_cookies_manager import EncryptedCookieManager
 from supabase import Client, create_client
 
@@ -2469,4 +2480,3 @@ elif menu == "Configuración":
         c1.image(current["logo_url"], caption="Logotipo principal", use_container_width=True)
     if current.get("secondary_logo_url"):
         c2.image(current["secondary_logo_url"], caption="Logotipo secundario", use_container_width=True)
-
